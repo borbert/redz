@@ -4,6 +4,15 @@ const posix = std.posix;
 
 pub const StopFlag = std.atomic.Value(bool);
 
+pub const PollHook = struct {
+    context: ?*anyopaque = null,
+    onPollFn: *const fn (context: ?*anyopaque) void,
+
+    pub fn onPoll(self: *const PollHook) void {
+        self.onPollFn(self.context);
+    }
+};
+
 pub const Server = struct {
     listener: std.net.Server,
     address: net.Address,
@@ -28,7 +37,12 @@ pub const Server = struct {
         self.listener.deinit();
     }
 
-    pub fn run(self: *Server, handler: *const ConnectionHandler, stop_flag: ?*const StopFlag) !void {
+    pub fn run(
+        self: *Server,
+        handler: *const ConnectionHandler,
+        stop_flag: ?*const StopFlag,
+        poll_hook: ?*const PollHook,
+    ) !void {
         while (stop_flag == null or !stop_flag.?.load(.acquire)) {
             if (stop_flag != null) {
                 var fds = [_]posix.pollfd{.{
@@ -37,6 +51,7 @@ pub const Server = struct {
                     .revents = 0,
                 }};
                 const ready = try posix.poll(&fds, 250);
+                if (poll_hook) |hook| hook.onPoll();
                 if (ready == 0) continue;
             }
 

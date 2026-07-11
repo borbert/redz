@@ -146,6 +146,45 @@ fn saveShutdownRdb(
     std.log.info("saved rdb file '{s}'", .{rdb_path});
 }
 
+fn maybeSavePeriodicSnapshot(
+    now_unix: i64,
+    allocator: std.mem.Allocator,
+    config: *const config_mod.PersistenceConfig,
+    runtime: *persistence.PersistenceRuntime,
+    store: *store_mod.Store,
+) !bool {
+    if (!config.rdbEnabled()) return false;
+    if (config.snapshot_interval_seconds == 0) return false;
+
+    const interval_seconds: i64 = @intCast(config.snapshot_interval_seconds);
+    if (runtime.last_save_unix != 0 and now_unix - runtime.last_save_unix < interval_seconds) {
+        return false;
+    }
+
+    const rdb_path = try config.rdbPath(allocator);
+    defer allocator.free(rdb_path);
+
+    try persistence.saveRdbAtomic(allocator, rdb_path, store);
+    runtime.last_save_unix = now_unix;
+    std.log.info("periodic rdb snapshot saved '{s}'", .{rdb_path});
+    return true;
+}
+
+fn pollPeriodicSnapshot(raw_context: ?*anyopaque) void {
+    const app_context: *AppContext = @ptrCast(@alignCast(raw_context.?));
+    const now_unix = std.time.timestamp();
+    _ = maybeSavePeriodicSnapshot(
+        now_unix,
+        app_context.allocator,
+        app_context.persistence_config,
+        app_context.persistence_runtime,
+        app_context.store,
+    ) catch |err| {
+        std.log.err("periodic rdb snapshot failed: {}", .{err});
+        return;
+    };
+}
+
 pub fn main() !void {
     gpa_impl = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_impl.deinit();
@@ -160,7 +199,9 @@ pub fn main() !void {
 
     try preparePersistenceDataDir(&persistence_config);
     try loadStartupRdb(allocator, &persistence_config, &global_store);
-    var persistence_runtime = persistence.PersistenceRuntime{};
+    var persistence_runtime = persistence.PersistenceRuntime{
+        .last_save_unix = std.time.timestamp(),
+    };
     installShutdownSignalHandlers();
 
     std.log.info("starting redz on 127.0.0.1:6379", .{});
@@ -178,8 +219,12 @@ pub fn main() !void {
         .context = &app_context,
         .handleConnectionFn = handleClient,
     };
+    const poll_hook = server_mod.PollHook{
+        .context = &app_context,
+        .onPollFn = pollPeriodicSnapshot,
+    };
 
-    try srv.run(&handler, &shutdown_requested);
+    try srv.run(&handler, &shutdown_requested, &poll_hook);
     try saveShutdownRdb(allocator, &persistence_config, &persistence_runtime, &global_store);
 }
 
@@ -249,4 +294,94 @@ test "startup rdb loads existing file and ignores missing file" {
     var corrupt_store = try store_mod.Store.init(allocator);
     defer corrupt_store.deinit();
     try std.testing.expectError(error.InvalidRdb, loadStartupRdb(allocator, &corrupt_config, &corrupt_store));
+}
+
+test "periodic snapshot helper saves only after interval elapses" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const data_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "periodic",
+    });
+    defer allocator.free(data_dir);
+
+    var config = config_mod.PersistenceConfig{
+        .mode = .rdb,
+        .data_dir = data_dir,
+        .rdb_filename = "periodic.redz",
+        .snapshot_interval_seconds = 10,
+    };
+    try preparePersistenceDataDir(&config);
+
+    var source_store = try store_mod.Store.init(allocator);
+    defer source_store.deinit();
+    try source_store.set("periodic", "saved");
+
+    var runtime = persistence.PersistenceRuntime{
+        .last_save_unix = 100,
+    };
+
+    try std.testing.expect(!try maybeSavePeriodicSnapshot(109, allocator, &config, &runtime, &source_store));
+
+    const rdb_path = try config.rdbPath(allocator);
+    defer allocator.free(rdb_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(rdb_path, .{}));
+
+    try std.testing.expect(try maybeSavePeriodicSnapshot(110, allocator, &config, &runtime, &source_store));
+    try std.testing.expectEqual(@as(i64, 110), runtime.last_save_unix);
+
+    const file = try std.fs.cwd().openFile(rdb_path, .{});
+    defer file.close();
+
+    var loaded_store = try store_mod.Store.init(allocator);
+    defer loaded_store.deinit();
+    try persistence.loadRdb(&loaded_store, file.deprecatedReader());
+    try std.testing.expectEqualStrings("saved", loaded_store.get("periodic").?);
+}
+
+test "periodic snapshot helper skips disabled autosnapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const data_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "disabled",
+    });
+    defer allocator.free(data_dir);
+
+    var store = try store_mod.Store.init(allocator);
+    defer store.deinit();
+    try store.set("disabled", "unchanged");
+
+    var runtime = persistence.PersistenceRuntime{};
+    var interval_zero_config = config_mod.PersistenceConfig{
+        .mode = .rdb,
+        .data_dir = data_dir,
+        .rdb_filename = "zero.redz",
+        .snapshot_interval_seconds = 0,
+    };
+    try preparePersistenceDataDir(&interval_zero_config);
+
+    try std.testing.expect(!try maybeSavePeriodicSnapshot(10, allocator, &interval_zero_config, &runtime, &store));
+    try std.testing.expectEqual(@as(i64, 0), runtime.last_save_unix);
+
+    const zero_path = try interval_zero_config.rdbPath(allocator);
+    defer allocator.free(zero_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(zero_path, .{}));
+
+    var disabled_config = config_mod.PersistenceConfig{
+        .mode = .none,
+        .data_dir = data_dir,
+        .rdb_filename = "none.redz",
+        .snapshot_interval_seconds = 1,
+    };
+    try std.testing.expect(!try maybeSavePeriodicSnapshot(10, allocator, &disabled_config, &runtime, &store));
+    try std.testing.expectEqual(@as(i64, 0), runtime.last_save_unix);
 }
