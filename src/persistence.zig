@@ -8,8 +8,8 @@ const EXPIRES_NONE: i64 = -1;
 pub fn saveRdb(store: *StoreMod.Store, writer: anytype) !void {
     try writer.writeAll(RDB_MAGIC);
     try writer.writeInt(u32, RDB_VERSION, .little);
-    const count = store.map.count();
-    try writer.writeInt(u32, @intCast(count), .little);
+    const entry_count = store.map.count();
+    try writer.writeInt(u32, @intCast(entry_count), .little);
 
     var it = store.map.iterator();
     while (it.next()) |kv| {
@@ -38,8 +38,8 @@ pub fn saveRdb(store: *StoreMod.Store, writer: anytype) !void {
             },
             .set => |*set_val| {
                 try writer.writeInt(u8, 2, .little); // type set
-                const count = set_val.items.count();
-                try writer.writeInt(u32, @intCast(count), .little);
+                const set_count = set_val.items.count();
+                try writer.writeInt(u32, @intCast(set_count), .little);
                 var kit = set_val.items.keyIterator();
                 while (kit.next()) |k| {
                     const m = k.*;
@@ -49,8 +49,8 @@ pub fn saveRdb(store: *StoreMod.Store, writer: anytype) !void {
             },
             .hash => |*hash| {
                 try writer.writeInt(u8, 3, .little); // type hash
-                const count = hash.fields.count();
-                try writer.writeInt(u32, @intCast(count), .little);
+                const hash_count = hash.fields.count();
+                try writer.writeInt(u32, @intCast(hash_count), .little);
                 var hit = hash.fields.iterator();
                 while (hit.next()) |kv_h| {
                     const f = kv_h.key_ptr.*;
@@ -73,9 +73,9 @@ pub fn loadRdb(store: *StoreMod.Store, reader: anytype) !void {
     const version = try reader.readInt(u32, .little);
     if (version != RDB_VERSION) return error.UnsupportedRdbVersion;
 
-    var count_buf: [4]u8 = undefined;
-    try reader.readNoEof(count_buf[0..]);
-    const entry_count = std.mem.readInt(u32, &count_buf, .little);
+    var entry_count_buf: [4]u8 = undefined;
+    try reader.readNoEof(entry_count_buf[0..]);
+    const entry_count = std.mem.readInt(u32, &entry_count_buf, .little);
 
     var entry_i: u32 = 0;
     while (entry_i < entry_count) : (entry_i += 1) {
@@ -278,4 +278,152 @@ pub fn loadRdb(store: *StoreMod.Store, reader: anytype) !void {
             },
         }
     }
+}
+
+fn roundTripStore(src: *StoreMod.Store, dst: *StoreMod.Store) !void {
+    var buf: [4096]u8 = undefined;
+    var out = std.io.fixedBufferStream(&buf);
+    try saveRdb(src, out.writer());
+
+    var in = std.io.fixedBufferStream(out.getWritten());
+    try loadRdb(dst, in.reader());
+}
+
+fn expectEntry(store: *StoreMod.Store, key: []const u8, expires_at: ?i64) !*StoreMod.Entry {
+    const entry = store.map.getPtr(key) orelse return error.MissingEntry;
+    try std.testing.expectEqual(expires_at, entry.expires_at);
+    return entry;
+}
+
+fn expectStringValue(store: *StoreMod.Store, key: []const u8, expected: []const u8, expires_at: ?i64) !void {
+    const entry = try expectEntry(store, key, expires_at);
+    switch (entry.value) {
+        .string => |value| try std.testing.expectEqualStrings(expected, value),
+        else => return error.WrongType,
+    }
+}
+
+fn expectListValue(store: *StoreMod.Store, key: []const u8, expected: []const []const u8, expires_at: ?i64) !void {
+    const entry = try expectEntry(store, key, expires_at);
+    switch (entry.value) {
+        .list => |*list| {
+            try std.testing.expectEqual(expected.len, list.items.items.len);
+            for (expected, list.items.items) |expected_item, actual_item| {
+                try std.testing.expectEqualStrings(expected_item, actual_item);
+            }
+        },
+        else => return error.WrongType,
+    }
+}
+
+fn expectSetValue(store: *StoreMod.Store, key: []const u8, expected: []const []const u8, expires_at: ?i64) !void {
+    const entry = try expectEntry(store, key, expires_at);
+    switch (entry.value) {
+        .set => |*set_val| {
+            try std.testing.expectEqual(expected.len, set_val.items.count());
+            for (expected) |member| {
+                try std.testing.expect(set_val.items.contains(member));
+            }
+        },
+        else => return error.WrongType,
+    }
+}
+
+fn expectHashValue(store: *StoreMod.Store, key: []const u8, expected_pairs: []const []const u8, expires_at: ?i64) !void {
+    const entry = try expectEntry(store, key, expires_at);
+    switch (entry.value) {
+        .hash => |*hash| {
+            try std.testing.expectEqual(expected_pairs.len / 2, hash.fields.count());
+            var i: usize = 0;
+            while (i < expected_pairs.len) : (i += 2) {
+                const actual = hash.fields.get(expected_pairs[i]) orelse return error.MissingHashField;
+                try std.testing.expectEqualStrings(expected_pairs[i + 1], actual);
+            }
+        },
+        else => return error.WrongType,
+    }
+}
+
+test "rdb round-trip string values and expiry sentinels" {
+    var src = try StoreMod.Store.init(std.testing.allocator);
+    defer src.deinit();
+    var dst = try StoreMod.Store.init(std.testing.allocator);
+    defer dst.deinit();
+
+    try src.set("plain", "persisted");
+    try src.set("volatile", "expires");
+    src.map.getPtr("plain").?.expires_at = null;
+    src.map.getPtr("volatile").?.expires_at = 1_700_000_123;
+
+    try roundTripStore(&src, &dst);
+
+    try std.testing.expectEqual(@as(usize, 2), dst.map.count());
+    try expectStringValue(&dst, "plain", "persisted", null);
+    try expectStringValue(&dst, "volatile", "expires", 1_700_000_123);
+}
+
+test "rdb round-trip list values" {
+    var src = try StoreMod.Store.init(std.testing.allocator);
+    defer src.deinit();
+    var dst = try StoreMod.Store.init(std.testing.allocator);
+    defer dst.deinit();
+
+    const values = [_][]const u8{ "one", "two", "three" };
+    _ = try src.listPushTail("numbers", &values);
+    src.map.getPtr("numbers").?.expires_at = 1_700_000_456;
+
+    try roundTripStore(&src, &dst);
+
+    try expectListValue(&dst, "numbers", &values, 1_700_000_456);
+}
+
+test "rdb round-trip set values" {
+    var src = try StoreMod.Store.init(std.testing.allocator);
+    defer src.deinit();
+    var dst = try StoreMod.Store.init(std.testing.allocator);
+    defer dst.deinit();
+
+    const members = [_][]const u8{ "alpha", "beta", "gamma" };
+    _ = try src.setAdd("letters", &members);
+    src.map.getPtr("letters").?.expires_at = null;
+
+    try roundTripStore(&src, &dst);
+
+    try expectSetValue(&dst, "letters", &members, null);
+}
+
+test "rdb round-trip hash values" {
+    var src = try StoreMod.Store.init(std.testing.allocator);
+    defer src.deinit();
+    var dst = try StoreMod.Store.init(std.testing.allocator);
+    defer dst.deinit();
+
+    const pairs = [_][]const u8{ "field-a", "value-a", "field-b", "value-b" };
+    _ = try src.hashSet("record", &pairs);
+    src.map.getPtr("record").?.expires_at = 1_700_000_789;
+
+    try roundTripStore(&src, &dst);
+
+    try expectHashValue(&dst, "record", &pairs, 1_700_000_789);
+}
+
+test "rdb rejects invalid magic" {
+    var store = try StoreMod.Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var input = std.io.fixedBufferStream("NOPE");
+    try std.testing.expectError(error.InvalidRdb, loadRdb(&store, input.reader()));
+}
+
+test "rdb rejects unsupported version" {
+    var store = try StoreMod.Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var bytes: [8]u8 = undefined;
+    var out = std.io.fixedBufferStream(&bytes);
+    try out.writer().writeAll(RDB_MAGIC);
+    try out.writer().writeInt(u32, RDB_VERSION + 1, .little);
+
+    var input = std.io.fixedBufferStream(out.getWritten());
+    try std.testing.expectError(error.UnsupportedRdbVersion, loadRdb(&store, input.reader()));
 }
