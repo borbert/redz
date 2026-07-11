@@ -9,8 +9,34 @@ const persistence = @import("persistence.zig");
 
 var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = undefined;
 var global_store: store_mod.Store = undefined;
+var shutdown_requested = server_mod.StopFlag.init(false);
 
-fn handleClient(conn: *server_mod.Connection) !void {
+const AppContext = struct {
+    allocator: std.mem.Allocator,
+    store: *store_mod.Store,
+    persistence_config: *const config_mod.PersistenceConfig,
+    persistence_runtime: *persistence.PersistenceRuntime,
+};
+
+fn handleShutdownSignal(_: i32) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installShutdownSignalHandlers() void {
+    if (builtin.os.tag == .windows) return;
+
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+}
+
+fn handleClient(raw_context: ?*anyopaque, conn: *server_mod.Connection) !void {
+    const app_context: *AppContext = @ptrCast(@alignCast(raw_context.?));
+
     var buf: [4096]u8 = undefined;
     const n = try conn.readRequest(&buf);
     if (n == 0) return;
@@ -32,7 +58,12 @@ fn handleClient(conn: *server_mod.Connection) !void {
 
     var out_buf: [4096]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
-    var ctx = commands.CommandContext{ .store = &global_store };
+    var ctx = commands.CommandContext{
+        .store = app_context.store,
+        .allocator = app_context.allocator,
+        .persistence_config = app_context.persistence_config,
+        .persistence_runtime = app_context.persistence_runtime,
+    };
 
     commands.dispatch(&ctx, cmd.name, cmd.args, out_fbs.writer()) catch |err| {
         var err_fbs = std.io.fixedBufferStream(&out_buf);
@@ -99,6 +130,22 @@ fn loadStartupRdb(
     std.log.info("loaded rdb file '{s}'", .{rdb_path});
 }
 
+fn saveShutdownRdb(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.PersistenceConfig,
+    runtime: *persistence.PersistenceRuntime,
+    store: *store_mod.Store,
+) !void {
+    if (!config.rdbEnabled()) return;
+
+    const rdb_path = try config.rdbPath(allocator);
+    defer allocator.free(rdb_path);
+
+    try persistence.saveRdbAtomic(allocator, rdb_path, store);
+    runtime.last_save_unix = std.time.timestamp();
+    std.log.info("saved rdb file '{s}'", .{rdb_path});
+}
+
 pub fn main() !void {
     gpa_impl = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_impl.deinit();
@@ -113,17 +160,27 @@ pub fn main() !void {
 
     try preparePersistenceDataDir(&persistence_config);
     try loadStartupRdb(allocator, &persistence_config, &global_store);
+    var persistence_runtime = persistence.PersistenceRuntime{};
+    installShutdownSignalHandlers();
 
     std.log.info("starting redz on 127.0.0.1:6379", .{});
 
     var srv = try server_mod.Server.init("127.0.0.1", 6379);
     defer srv.deinit();
 
+    var app_context = AppContext{
+        .allocator = allocator,
+        .store = &global_store,
+        .persistence_config = &persistence_config,
+        .persistence_runtime = &persistence_runtime,
+    };
     const handler = server_mod.ConnectionHandler{
+        .context = &app_context,
         .handleConnectionFn = handleClient,
     };
 
-    try srv.run(&handler);
+    try srv.run(&handler, &shutdown_requested);
+    try saveShutdownRdb(allocator, &persistence_config, &persistence_runtime, &global_store);
 }
 
 test "startup rdb loads existing file and ignores missing file" {

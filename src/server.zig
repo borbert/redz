@@ -2,6 +2,8 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 
+pub const StopFlag = std.atomic.Value(bool);
+
 pub const Server = struct {
     listener: std.net.Server,
     address: net.Address,
@@ -26,8 +28,18 @@ pub const Server = struct {
         self.listener.deinit();
     }
 
-    pub fn run(self: *Server, handler: *const ConnectionHandler) !void {
-        while (true) {
+    pub fn run(self: *Server, handler: *const ConnectionHandler, stop_flag: ?*const StopFlag) !void {
+        while (stop_flag == null or !stop_flag.?.load(.acquire)) {
+            if (stop_flag != null) {
+                var fds = [_]posix.pollfd{.{
+                    .fd = self.listener.stream.handle,
+                    .events = posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = try posix.poll(&fds, 250);
+                if (ready == 0) continue;
+            }
+
             const client = try self.listener.accept();
             // client has: .stream (TcpStream) and .address
 
@@ -79,11 +91,10 @@ pub const Connection = struct {
 };
 
 pub const ConnectionHandler = struct {
-    // for now, this can just be a function pointer, later we can add state
-    handleConnectionFn: *const fn (conn: *Connection) anyerror!void,
+    context: ?*anyopaque = null,
+    handleConnectionFn: *const fn (context: ?*anyopaque, conn: *Connection) anyerror!void,
 
     pub fn handleConnection(self: *const ConnectionHandler, conn: *Connection) !void {
-        // just forward to handleConnectionFn(conn)
-        return self.handleConnectionFn(conn);
+        return self.handleConnectionFn(self.context, conn);
     }
 };

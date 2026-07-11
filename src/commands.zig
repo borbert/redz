@@ -1,9 +1,14 @@
 const std = @import("std");
 const StoreMod = @import("store.zig");
 const resp = @import("resp.zig");
+const config_mod = @import("config.zig");
+const persistence = @import("persistence.zig");
 
 pub const CommandContext = struct {
     store: *StoreMod.Store,
+    allocator: ?std.mem.Allocator = null,
+    persistence_config: ?*const config_mod.PersistenceConfig = null,
+    persistence_runtime: ?*persistence.PersistenceRuntime = null,
 };
 
 pub fn dispatch(ctx: *CommandContext, name: []const u8, args: []const []const u8, writer: anytype) !void {
@@ -16,6 +21,7 @@ pub fn dispatch(ctx: *CommandContext, name: []const u8, args: []const []const u8
     if (std.ascii.eqlIgnoreCase(name, "EXPIRE")) return handleExpire(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "TTL")) return handleTtl(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "PERSIST")) return handlePersist(ctx, args, writer);
+    if (std.ascii.eqlIgnoreCase(name, "SAVE")) return handleSave(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "LPUSH")) return handleLpush(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "RPUSH")) return handleRpush(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "LPOP")) return handleLpop(ctx, args, writer);
@@ -85,6 +91,29 @@ fn handlePersist(ctx: *CommandContext, args: []const []const u8, writer: anytype
     if (args.len != 1) return error.WrongArity;
     const ok = ctx.store.persist(args[0]);
     try resp.writeInteger(writer, if (ok) 1 else 0);
+}
+
+fn handleSave(ctx: *CommandContext, args: []const []const u8, writer: anytype) !void {
+    if (args.len != 0) return error.WrongArity;
+
+    const config = ctx.persistence_config orelse {
+        try resp.writeError(writer, "ERR RDB persistence is disabled");
+        return;
+    };
+    if (!config.rdbEnabled()) {
+        try resp.writeError(writer, "ERR RDB persistence is disabled");
+        return;
+    }
+
+    const allocator = ctx.allocator orelse return error.PersistenceNotConfigured;
+    const rdb_path = try config.rdbPath(allocator);
+    defer allocator.free(rdb_path);
+
+    try persistence.saveRdbAtomic(allocator, rdb_path, ctx.store);
+    if (ctx.persistence_runtime) |runtime| {
+        runtime.last_save_unix = std.time.timestamp();
+    }
+    try resp.writeSimpleString(writer, "OK");
 }
 
 fn handleLpush(ctx: *CommandContext, args: []const []const u8, writer: anytype) !void {
@@ -273,4 +302,72 @@ test "commands handlers RESP output" {
     fbs.reset();
     const rpush_wrong = [_][]const u8{ "bad", "bar" };
     try std.testing.expectError(error.WrongType, dispatch(&ctx, "RPUSH", rpush_wrong[0..], fbs.writer()));
+}
+
+test "save command returns error when rdb disabled" {
+    var store = try StoreMod.Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var config = config_mod.PersistenceConfig{};
+    var ctx = CommandContext{
+        .store = &store,
+        .allocator = std.testing.allocator,
+        .persistence_config = &config,
+    };
+
+    var buf: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const args = [_][]const u8{};
+    try dispatch(&ctx, "SAVE", args[0..], fbs.writer());
+
+    try std.testing.expectEqualStrings("-ERR RDB persistence is disabled\r\n", fbs.getWritten());
+}
+
+test "save command atomically writes rdb and updates last save" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const data_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+    });
+    defer allocator.free(data_dir);
+
+    var store = try StoreMod.Store.init(allocator);
+    defer store.deinit();
+    try store.set("saved", "value");
+
+    var config = config_mod.PersistenceConfig{
+        .mode = .rdb,
+        .data_dir = data_dir,
+        .rdb_filename = "save-command.redz",
+    };
+    var runtime = persistence.PersistenceRuntime{};
+    var ctx = CommandContext{
+        .store = &store,
+        .allocator = allocator,
+        .persistence_config = &config,
+        .persistence_runtime = &runtime,
+    };
+
+    var buf: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const args = [_][]const u8{};
+    try dispatch(&ctx, "SAVE", args[0..], fbs.writer());
+
+    try std.testing.expectEqualStrings("+OK\r\n", fbs.getWritten());
+    try std.testing.expect(runtime.last_save_unix > 0);
+
+    const rdb_path = try config.rdbPath(allocator);
+    defer allocator.free(rdb_path);
+    var file = try std.fs.cwd().openFile(rdb_path, .{});
+    defer file.close();
+
+    var loaded = try StoreMod.Store.init(allocator);
+    defer loaded.deinit();
+    try persistence.loadRdb(&loaded, file.deprecatedReader());
+    const value = loaded.get("saved") orelse return error.MissingSavedValue;
+    try std.testing.expectEqualStrings("value", value);
 }

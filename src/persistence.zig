@@ -5,6 +5,10 @@ const RDB_MAGIC: *const [4]u8 = "REDZ";
 const RDB_VERSION: u32 = 1;
 const EXPIRES_NONE: i64 = -1;
 
+pub const PersistenceRuntime = struct {
+    last_save_unix: i64 = 0,
+};
+
 pub fn saveRdb(store: *StoreMod.Store, writer: anytype) !void {
     try writer.writeAll(RDB_MAGIC);
     try writer.writeInt(u32, RDB_VERSION, .little);
@@ -63,6 +67,23 @@ pub fn saveRdb(store: *StoreMod.Store, writer: anytype) !void {
             },
         }
     }
+}
+
+pub fn saveRdbAtomic(allocator: std.mem.Allocator, path: []const u8, store: *StoreMod.Store) !void {
+    const tmp_path = try std.mem.concat(allocator, u8, &[_][]const u8{ path, ".tmp" });
+    defer allocator.free(tmp_path);
+
+    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    var file_open = true;
+    errdefer if (file_open) file.close();
+    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    try saveRdb(store, file.deprecatedWriter());
+    try file.sync();
+    file.close();
+    file_open = false;
+
+    try std.fs.cwd().rename(tmp_path, path);
 }
 
 pub fn loadRdb(store: *StoreMod.Store, reader: anytype) !void {
@@ -426,4 +447,36 @@ test "rdb rejects unsupported version" {
 
     var input = std.io.fixedBufferStream(out.getWritten());
     try std.testing.expectError(error.UnsupportedRdbVersion, loadRdb(&store, input.reader()));
+}
+
+test "atomic rdb save writes final file and removes temp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const rdb_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "dump.redz",
+    });
+    defer allocator.free(rdb_path);
+
+    var src = try StoreMod.Store.init(allocator);
+    defer src.deinit();
+    try src.set("atomic", "persisted");
+
+    try saveRdbAtomic(allocator, rdb_path, &src);
+
+    var file = try std.fs.cwd().openFile(rdb_path, .{});
+    defer file.close();
+
+    var dst = try StoreMod.Store.init(allocator);
+    defer dst.deinit();
+    try loadRdb(&dst, file.deprecatedReader());
+    try expectStringValue(&dst, "atomic", "persisted", null);
+
+    const tmp_path = try std.mem.concat(allocator, u8, &[_][]const u8{ rdb_path, ".tmp" });
+    defer allocator.free(tmp_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(tmp_path, .{}));
 }
