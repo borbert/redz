@@ -23,5 +23,6 @@ test "basic add functionality" {
 }
 
 test {
+    _ = @import("aof.zig");
     _ = @import("persistence.zig");
 }

@@ -6,6 +6,7 @@ const commands = @import("commands.zig");
 const resp = @import("resp.zig");
 const config_mod = @import("config.zig");
 const persistence = @import("persistence.zig");
+const aof = @import("aof.zig");
 
 var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = undefined;
 var global_store: store_mod.Store = undefined;
@@ -16,6 +17,7 @@ const AppContext = struct {
     store: *store_mod.Store,
     persistence_config: *const config_mod.PersistenceConfig,
     persistence_runtime: *persistence.PersistenceRuntime,
+    aof_writer: ?*aof.AofWriter = null,
 };
 
 fn handleShutdownSignal(_: i32) callconv(.c) void {
@@ -82,6 +84,21 @@ fn handleClient(raw_context: ?*anyopaque, conn: *server_mod.Connection) !void {
         return;
     };
 
+    if (commands.isMutatingCommand(cmd.name)) {
+        if (app_context.aof_writer) |aof_writer| {
+            var appended = true;
+            aof_writer.append(read_slice) catch |err| {
+                appended = false;
+                std.log.err("aof append failed after successful command '{s}': {}", .{ cmd.name, err });
+            };
+            if (appended) {
+                aof_writer.maybeFsync(std.time.timestamp()) catch |err| {
+                    std.log.err("aof fsync failed after successful command '{s}': {}", .{ cmd.name, err });
+                };
+            }
+        }
+    }
+
     try conn.writeAll(out_fbs.getWritten());
 }
 
@@ -128,6 +145,27 @@ fn loadStartupRdb(
     };
 
     std.log.info("loaded rdb file '{s}'", .{rdb_path});
+}
+
+fn openStartupAof(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.PersistenceConfig,
+) !?aof.AofWriter {
+    if (!config.aofEnabled()) return null;
+
+    const aof_path = try config.aofPath(allocator);
+    defer allocator.free(aof_path);
+
+    var writer = aof.AofWriter.open(aof_path, config.aof_fsync) catch |err| {
+        if (!builtin.is_test) {
+            std.log.err("failed open aof file '{s}': {}", .{ aof_path, err });
+        }
+        return err;
+    };
+    errdefer writer.close() catch {};
+
+    std.log.info("opened aof file '{s}' with fsync mode {s}", .{ aof_path, @tagName(config.aof_fsync) });
+    return writer;
 }
 
 fn saveShutdownRdb(
@@ -199,6 +237,14 @@ pub fn main() !void {
 
     try preparePersistenceDataDir(&persistence_config);
     try loadStartupRdb(allocator, &persistence_config, &global_store);
+    var aof_writer = try openStartupAof(allocator, &persistence_config);
+    defer {
+        if (aof_writer) |*writer| {
+            writer.close() catch |err| {
+                std.log.err("aof close failed: {}", .{err});
+            };
+        }
+    }
     var persistence_runtime = persistence.PersistenceRuntime{
         .last_save_unix = std.time.timestamp(),
     };
@@ -214,6 +260,7 @@ pub fn main() !void {
         .store = &global_store,
         .persistence_config = &persistence_config,
         .persistence_runtime = &persistence_runtime,
+        .aof_writer = if (aof_writer) |*writer| writer else null,
     };
     const handler = server_mod.ConnectionHandler{
         .context = &app_context,
@@ -225,6 +272,11 @@ pub fn main() !void {
     };
 
     try srv.run(&handler, &shutdown_requested, &poll_hook);
+    if (aof_writer) |*writer| {
+        writer.close() catch |err| {
+            std.log.err("aof close failed: {}", .{err});
+        };
+    }
     try saveShutdownRdb(allocator, &persistence_config, &persistence_runtime, &global_store);
 }
 

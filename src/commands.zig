@@ -11,6 +11,21 @@ pub const CommandContext = struct {
     persistence_runtime: ?*persistence.PersistenceRuntime = null,
 };
 
+pub fn isMutatingCommand(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "SET") or
+        std.ascii.eqlIgnoreCase(name, "DEL") or
+        std.ascii.eqlIgnoreCase(name, "EXPIRE") or
+        std.ascii.eqlIgnoreCase(name, "PERSIST") or
+        std.ascii.eqlIgnoreCase(name, "LPUSH") or
+        std.ascii.eqlIgnoreCase(name, "RPUSH") or
+        std.ascii.eqlIgnoreCase(name, "LPOP") or
+        std.ascii.eqlIgnoreCase(name, "RPOP") or
+        std.ascii.eqlIgnoreCase(name, "SADD") or
+        std.ascii.eqlIgnoreCase(name, "SREM") or
+        std.ascii.eqlIgnoreCase(name, "HSET") or
+        std.ascii.eqlIgnoreCase(name, "HDEL");
+}
+
 pub fn dispatch(ctx: *CommandContext, name: []const u8, args: []const []const u8, writer: anytype) !void {
     if (std.ascii.eqlIgnoreCase(name, "PING")) return handlePing(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "ECHO")) return handleEcho(ctx, args, writer);
