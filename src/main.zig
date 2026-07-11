@@ -147,6 +147,26 @@ fn loadStartupRdb(
     std.log.info("loaded rdb file '{s}'", .{rdb_path});
 }
 
+fn replayStartupAof(
+    allocator: std.mem.Allocator,
+    config: *const config_mod.PersistenceConfig,
+    store: *store_mod.Store,
+) !void {
+    if (!config.aofEnabled()) return;
+
+    const aof_path = try config.aofPath(allocator);
+    defer allocator.free(aof_path);
+
+    aof.replayAof(allocator, store, aof_path) catch |err| {
+        if (!builtin.is_test) {
+            std.log.err("failed to replay aof file '{s}': {}", .{ aof_path, err });
+        }
+        return err;
+    };
+
+    std.log.info("replayed aof file '{s}'", .{aof_path});
+}
+
 fn openStartupAof(
     allocator: std.mem.Allocator,
     config: *const config_mod.PersistenceConfig,
@@ -237,6 +257,7 @@ pub fn main() !void {
 
     try preparePersistenceDataDir(&persistence_config);
     try loadStartupRdb(allocator, &persistence_config, &global_store);
+    try replayStartupAof(allocator, &persistence_config, &global_store);
     var aof_writer = try openStartupAof(allocator, &persistence_config);
     defer {
         if (aof_writer) |*writer| {

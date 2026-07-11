@@ -16,8 +16,8 @@ pub fn parseCommand(allocator: std.mem.Allocator, reader: anytype) !RespCommand 
 
     var names = try allocator.alloc([]const u8, count);
     var filled: usize = 0;
-    errdefer for (names[0..filled]) |s| allocator.free(s);
     errdefer allocator.free(names);
+    errdefer for (names[0..filled]) |s| allocator.free(s);
     for (0..count) |i| {
         names[i] = try readBulkString(allocator, reader);
         filled = i + 1;

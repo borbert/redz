@@ -1,7 +1,12 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
+const commands = @import("commands.zig");
+const persistence = @import("persistence.zig");
+const resp = @import("resp.zig");
+const store_mod = @import("store.zig");
 
 const NEVER_FSYNCED_UNIX = std.math.minInt(i64);
+const MAX_REPLAY_BYTES = 64 * 1024 * 1024;
 
 pub const AofWriter = struct {
     file: ?std.fs.File,
@@ -56,6 +61,42 @@ pub const AofWriter = struct {
         self.last_fsync_unix = now_unix;
     }
 };
+
+pub fn replayAof(allocator: std.mem.Allocator, store: *store_mod.Store, path: []const u8) !void {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, MAX_REPLAY_BYTES);
+    defer allocator.free(bytes);
+
+    try replayAofBytes(allocator, store, bytes);
+}
+
+pub fn replayAofBytes(allocator: std.mem.Allocator, store: *store_mod.Store, bytes: []const u8) !void {
+    var stream = std.io.fixedBufferStream(bytes);
+    var ctx = commands.CommandContext{
+        .store = store,
+        .allocator = allocator,
+    };
+    var discard_buffer: [256]u8 = undefined;
+    var discard: std.Io.Writer.Discarding = .init(&discard_buffer);
+
+    while (stream.pos < bytes.len) {
+        var cmd = resp.parseCommand(allocator, stream.reader()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidResp,
+        };
+        defer resp.freeCommand(allocator, &cmd);
+
+        commands.dispatch(&ctx, cmd.name, cmd.args, &discard.writer) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidAof,
+        };
+    }
+}
 
 test "aof append writes raw bytes and preserves existing file contents" {
     var tmp = std.testing.tmpDir(.{});
@@ -167,4 +208,75 @@ test "aof fsync no mode skips explicit sync on append path" {
     try writer.maybeFsync(30);
     try std.testing.expectEqual(@as(usize, 0), writer.fsync_count);
     try std.testing.expectEqual(NEVER_FSYNCED_UNIX, writer.last_fsync_unix);
+}
+
+test "aof replay applies commands into empty store" {
+    const allocator = std.testing.allocator;
+    var store = try store_mod.Store.init(allocator);
+    defer store.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "replay.aof",
+    });
+    defer allocator.free(path);
+
+    {
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.deprecatedWriter().writeAll(
+            "*3\r\n$3\r\nSET\r\n$5\r\nalpha\r\n$3\r\none\r\n" ++
+                "*3\r\n$3\r\nSET\r\n$4\r\nbeta\r\n$3\r\ntwo\r\n" ++
+                "*2\r\n$3\r\nDEL\r\n$4\r\nbeta\r\n",
+        );
+    }
+
+    try replayAof(allocator, &store, path);
+
+    try std.testing.expectEqualStrings("one", store.get("alpha").?);
+    try std.testing.expect(store.get("beta") == null);
+}
+
+test "aof replay ignores missing file and rejects truncated input" {
+    const allocator = std.testing.allocator;
+    var store = try store_mod.Store.init(allocator);
+    defer store.deinit();
+
+    try replayAof(allocator, &store, ".zig-cache/tmp/redz-missing-replay.aof");
+    try std.testing.expectEqual(@as(usize, 0), store.map.count());
+
+    try std.testing.expectError(
+        error.InvalidResp,
+        replayAofBytes(allocator, &store, "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalu"),
+    );
+}
+
+test "aof replay applies delta after rdb baseline" {
+    const allocator = std.testing.allocator;
+    var baseline = try store_mod.Store.init(allocator);
+    defer baseline.deinit();
+    var loaded = try store_mod.Store.init(allocator);
+    defer loaded.deinit();
+
+    try baseline.set("base", "rdb");
+    var rdb_buffer: [1024]u8 = undefined;
+    var out = std.io.fixedBufferStream(&rdb_buffer);
+    try persistence.saveRdb(&baseline, out.writer());
+
+    var input = std.io.fixedBufferStream(out.getWritten());
+    try persistence.loadRdb(&loaded, input.reader());
+    try replayAofBytes(
+        allocator,
+        &loaded,
+        "*3\r\n$3\r\nSET\r\n$5\r\ndelta\r\n$3\r\naof\r\n" ++
+            "*3\r\n$3\r\nSET\r\n$4\r\nbase\r\n$7\r\nupdated\r\n",
+    );
+
+    try std.testing.expectEqualStrings("updated", loaded.get("base").?);
+    try std.testing.expectEqualStrings("aof", loaded.get("delta").?);
 }
