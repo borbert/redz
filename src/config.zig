@@ -188,4 +188,15 @@ test "parseFromArgv rejects invalid and missing values" {
         error.InvalidSnapshotInterval,
         parseFromArgv(std.testing.allocator, &[_][]const u8{ "redz", "--snapshot-interval", "soon" }),
     );
+    try std.testing.expectError(
+        error.InvalidAofFsync,
+        parseFromArgv(std.testing.allocator, &[_][]const u8{ "redz", "--aof-fsync", "sometimes" }),
+    );
+}
+
+test "parseAofFsyncMode accepts supported modes" {
+    try std.testing.expectEqual(AofFsyncMode.always, parseAofFsyncMode("always").?);
+    try std.testing.expectEqual(AofFsyncMode.everysec, parseAofFsyncMode("everysec").?);
+    try std.testing.expectEqual(AofFsyncMode.no, parseAofFsyncMode("no").?);
+    try std.testing.expectEqual(@as(?AofFsyncMode, null), parseAofFsyncMode("weekly"));
 }

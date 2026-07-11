@@ -37,6 +37,7 @@ pub fn dispatch(ctx: *CommandContext, name: []const u8, args: []const []const u8
     if (std.ascii.eqlIgnoreCase(name, "TTL")) return handleTtl(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "PERSIST")) return handlePersist(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "SAVE")) return handleSave(ctx, args, writer);
+    if (std.ascii.eqlIgnoreCase(name, "LASTSAVE")) return handleLastSave(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "LPUSH")) return handleLpush(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "RPUSH")) return handleRpush(ctx, args, writer);
     if (std.ascii.eqlIgnoreCase(name, "LPOP")) return handleLpop(ctx, args, writer);
@@ -129,6 +130,12 @@ fn handleSave(ctx: *CommandContext, args: []const []const u8, writer: anytype) !
         runtime.last_save_unix = std.time.timestamp();
     }
     try resp.writeSimpleString(writer, "OK");
+}
+
+fn handleLastSave(ctx: *CommandContext, args: []const []const u8, writer: anytype) !void {
+    if (args.len != 0) return error.WrongArity;
+    const ts: i64 = if (ctx.persistence_runtime) |runtime| runtime.last_save_unix else 0;
+    try resp.writeInteger(writer, ts);
 }
 
 fn handleLpush(ctx: *CommandContext, args: []const []const u8, writer: anytype) !void {
@@ -385,4 +392,57 @@ test "save command atomically writes rdb and updates last save" {
     try persistence.loadRdb(&loaded, file.deprecatedReader());
     const value = loaded.get("saved") orelse return error.MissingSavedValue;
     try std.testing.expectEqualStrings("value", value);
+}
+
+test "lastsave returns zero then updated timestamp" {
+    var store = try StoreMod.Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var runtime = persistence.PersistenceRuntime{};
+    var ctx = CommandContext{
+        .store = &store,
+        .persistence_runtime = &runtime,
+    };
+
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const args = [_][]const u8{};
+    try dispatch(&ctx, "LASTSAVE", args[0..], fbs.writer());
+    try std.testing.expectEqualStrings(":0\r\n", fbs.getWritten());
+
+    runtime.last_save_unix = 1_700_000_000;
+    fbs.reset();
+    try dispatch(&ctx, "LASTSAVE", args[0..], fbs.writer());
+    try std.testing.expectEqualStrings(":1700000000\r\n", fbs.getWritten());
+}
+
+test "both mode rdb baseline plus aof delta and mutating classification" {
+    const allocator = std.testing.allocator;
+    var baseline = try StoreMod.Store.init(allocator);
+    defer baseline.deinit();
+    var loaded = try StoreMod.Store.init(allocator);
+    defer loaded.deinit();
+
+    try baseline.set("base", "from-rdb");
+    var rdb_buf: [1024]u8 = undefined;
+    var out = std.io.fixedBufferStream(&rdb_buf);
+    try persistence.saveRdb(&baseline, out.writer());
+
+    var input = std.io.fixedBufferStream(out.getWritten());
+    try persistence.loadRdb(&loaded, input.reader());
+
+    const aof = @import("aof.zig");
+    try aof.replayAofBytes(
+        allocator,
+        &loaded,
+        "*3\r\n$3\r\nSET\r\n$5\r\ndelta\r\n$3\r\naof\r\n",
+    );
+
+    try std.testing.expectEqualStrings("from-rdb", loaded.get("base").?);
+    try std.testing.expectEqualStrings("aof", loaded.get("delta").?);
+    try std.testing.expect(isMutatingCommand("SET"));
+    try std.testing.expect(isMutatingCommand("HDEL"));
+    try std.testing.expect(!isMutatingCommand("GET"));
+    try std.testing.expect(!isMutatingCommand("LASTSAVE"));
+    try std.testing.expect(!isMutatingCommand("SAVE"));
 }
