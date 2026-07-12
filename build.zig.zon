@@ -80,5 +80,6 @@
         "CODE_OF_CONDUCT.md",
         "Dockerfile",
         "docker-compose.yml",
+        "scripts",
     },
 }

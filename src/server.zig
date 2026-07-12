@@ -1,6 +1,7 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const tls = @import("tls.zig");
 
 pub const StopFlag = std.atomic.Value(bool);
 
@@ -16,8 +17,9 @@ pub const PollHook = struct {
 pub const Server = struct {
     listener: std.net.Server,
     address: net.Address,
+    tls_context: ?*tls.TlsContext = null,
 
-    pub fn init(host: []const u8, port: u16) !Server {
+    pub fn init(host: []const u8, port: u16, tls_context: ?*tls.TlsContext) !Server {
         const ip4 = try net.Ip4Address.parse(host, port);
         const addr = net.Address{ .in = ip4 };
 
@@ -28,6 +30,7 @@ pub const Server = struct {
         return Server{
             .listener = server,
             .address = addr,
+            .tls_context = tls_context,
         };
     }
 
@@ -60,7 +63,17 @@ pub const Server = struct {
             conn.* = .{
                 .socket = client.stream.handle,
                 .addr = client.address,
+                .tls_conn = null,
             };
+
+            if (self.tls_context) |tls_ctx| {
+                conn.tls_conn = tls_ctx.accept(conn.socket) catch |err| {
+                    std.log.err("TLS accept failed: {s}", .{@errorName(err)});
+                    conn.close();
+                    std.heap.page_allocator.destroy(conn);
+                    continue;
+                };
+            }
 
             const thread = std.Thread.spawn(.{}, connectionWorker, .{ handler, conn }) catch |err| {
                 conn.close();
@@ -86,12 +99,19 @@ fn connectionWorker(handler: *const ConnectionHandler, conn: *Connection) void {
 pub const Connection = struct {
     socket: posix.socket_t,
     addr: net.Address,
+    tls_conn: ?tls.TlsConn = null,
 
     pub fn readRequest(self: *Connection, buf: []u8) !usize {
+        if (self.tls_conn) |*tls_conn| {
+            return tls_conn.read(buf);
+        }
         return posix.read(self.socket, buf);
     }
 
     pub fn writeAll(self: *Connection, data: []const u8) !void {
+        if (self.tls_conn) |*tls_conn| {
+            return tls_conn.writeAll(data);
+        }
         var offset: usize = 0;
         while (offset < data.len) {
             const written = try posix.write(
@@ -106,6 +126,10 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
+        if (self.tls_conn) |*tls_conn| {
+            tls_conn.deinit();
+            self.tls_conn = null;
+        }
         posix.close(self.socket);
     }
 };

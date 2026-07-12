@@ -6,6 +6,7 @@ const config_mod = @import("config.zig");
 const persistence = @import("persistence.zig");
 const aof = @import("aof.zig");
 const client = @import("client.zig");
+const tls = @import("tls.zig");
 
 var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = undefined;
 var global_store: store_mod.Store = undefined;
@@ -197,9 +198,20 @@ pub fn main() !void {
     };
     installShutdownSignalHandlers();
 
+    var tls_context: ?tls.TlsContext = null;
+    defer if (tls_context) |*ctx| ctx.deinit();
+    if (config.tlsEnabled()) {
+        tls_context = try tls.TlsContext.init(config.tls_cert.?, config.tls_key.?);
+        std.log.info("TLS enabled (cert={s})", .{config.tls_cert.?});
+    }
+
+    if (config.authRequired()) {
+        std.log.info("AUTH required (--requirepass set)", .{});
+    }
+
     std.log.info("starting redz on {s}:{d}", .{ config.host, config.port });
 
-    var srv = try server_mod.Server.init(config.host, config.port);
+    var srv = try server_mod.Server.init(config.host, config.port, if (tls_context) |*ctx| ctx else null);
     defer srv.deinit();
 
     var app_context = client.AppContext{

@@ -30,6 +30,7 @@ pub fn handleConnection(raw_context: ?*anyopaque, conn: *server_mod.Connection) 
     defer input.deinit(allocator);
 
     var read_buf: [read_chunk]u8 = undefined;
+    var authenticated = !app_context.config.authRequired();
 
     while (true) {
         var parsed = resp.parseCommandFromBuffer(allocator, input.items) catch |err| switch (err) {
@@ -49,7 +50,7 @@ pub fn handleConnection(raw_context: ?*anyopaque, conn: *server_mod.Connection) 
         defer allocator.free(raw_command);
 
         drainConsumed(&input, parsed.bytes_consumed);
-        try processCommand(app_context, conn, &parsed.command, raw_command);
+        try processCommand(app_context, conn, &parsed.command, raw_command, &authenticated);
     }
 }
 
@@ -91,9 +92,22 @@ fn processCommand(
     conn: *server_mod.Connection,
     cmd: *const resp.RespCommand,
     raw_command: []const u8,
+    authenticated: *bool,
 ) !void {
     var out_buf: [65536]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    if (std.ascii.eqlIgnoreCase(cmd.name, "AUTH")) {
+        try handleAuth(app_context, cmd.args, authenticated, out_fbs.writer());
+        try conn.writeAll(out_fbs.getWritten());
+        return;
+    }
+
+    if (app_context.config.authRequired() and !authenticated.*) {
+        try resp.writeError(out_fbs.writer(), "NOAUTH Authentication required.");
+        try conn.writeAll(out_fbs.getWritten());
+        return;
+    }
 
     app_context.mutex.lock();
     defer app_context.mutex.unlock();
@@ -121,6 +135,35 @@ fn processCommand(
 
     maybeAppendAof(app_context, cmd.name, raw_command);
     try conn.writeAll(out_fbs.getWritten());
+}
+
+fn handleAuth(
+    app_context: *AppContext,
+    args: []const []const u8,
+    authenticated: *bool,
+    writer: anytype,
+) !void {
+    if (!app_context.config.authRequired()) {
+        try resp.writeError(writer, "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?");
+        return;
+    }
+
+    const password = switch (args.len) {
+        1 => args[0],
+        2 => args[1], // AUTH username password — username ignored for now
+        else => {
+            try resp.writeError(writer, "ERR wrong number of arguments for 'auth' command");
+            return;
+        },
+    };
+
+    if (app_context.config.passwordsEqual(password)) {
+        authenticated.* = true;
+        try resp.writeSimpleString(writer, "OK");
+    } else {
+        authenticated.* = false;
+        try resp.writeError(writer, "WRONGPASS invalid username-password pair or user is disabled.");
+    }
 }
 
 fn maybeAppendAof(app_context: *AppContext, cmd_name: []const u8, raw_command: []const u8) void {
@@ -159,4 +202,43 @@ test "incomplete command waits for more bytes" {
         error.IncompleteResp,
         resp.parseCommandFromBuffer(allocator, "*1\r\n$4\r\nPI"),
     );
+}
+
+test "auth gate rejects until valid password" {
+    var store = try store_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    var mutex = std.Thread.Mutex{};
+    var runtime = persistence.PersistenceRuntime{};
+    var config = config_mod.Config{
+        .requirepass = "hunter2",
+    };
+    var app = AppContext{
+        .allocator = std.testing.allocator,
+        .store = &store,
+        .mutex = &mutex,
+        .config = &config,
+        .persistence_runtime = &runtime,
+    };
+
+    var authenticated = false;
+    var buf: [128]u8 = undefined;
+
+    {
+        var fbs = std.io.fixedBufferStream(&buf);
+        try handleAuth(&app, &[_][]const u8{"wrong"}, &authenticated, fbs.writer());
+        try std.testing.expect(!authenticated);
+        try std.testing.expect(std.mem.startsWith(u8, fbs.getWritten(), "-WRONGPASS"));
+    }
+    {
+        var fbs = std.io.fixedBufferStream(&buf);
+        try handleAuth(&app, &[_][]const u8{"hunter2"}, &authenticated, fbs.writer());
+        try std.testing.expect(authenticated);
+        try std.testing.expectEqualStrings("+OK\r\n", fbs.getWritten());
+    }
+    {
+        var fbs = std.io.fixedBufferStream(&buf);
+        try handleAuth(&app, &[_][]const u8{ "default", "hunter2" }, &authenticated, fbs.writer());
+        try std.testing.expect(authenticated);
+        try std.testing.expectEqualStrings("+OK\r\n", fbs.getWritten());
+    }
 }

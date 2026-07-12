@@ -7,6 +7,7 @@ appendonly.redz.aof
 *.redz
 *.redz.aof
 /data/
+/certs/
 .env
 .env.*
 !.env.example

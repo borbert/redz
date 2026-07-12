@@ -6,13 +6,29 @@ services:
       - "6379:6379"
     volumes:
       - redz-data:/data
+      # Optional TLS material:
+      # - ./certs:/certs:ro
     environment:
       REDZ_HOST: "0.0.0.0"
       REDZ_PORT: "6379"
+      REDZ_REQUIREPASS: "${REDZ_REQUIREPASS:-changeme}"
       REDZ_PERSISTENCE: "both"
       REDZ_DATA_DIR: "/data"
       REDZ_SNAPSHOT_INTERVAL: "60"
       REDZ_AOF_FSYNC: "everysec"
+      # REDZ_TLS_CERT: "/certs/cert.pem"
+      # REDZ_TLS_KEY: "/certs/key.pem"
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "6379"
+      - --requirepass
+      - "${REDZ_REQUIREPASS:-changeme}"
+      - --persistence
+      - both
+      - --data-dir
+      - /data
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 6379 || exit 1"]

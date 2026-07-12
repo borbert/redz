@@ -61,12 +61,45 @@ pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 6379,
     owns_host: bool = false,
+    requirepass: ?[]const u8 = null,
+    owns_requirepass: bool = false,
+    tls_cert: ?[]const u8 = null,
+    owns_tls_cert: bool = false,
+    tls_key: ?[]const u8 = null,
+    owns_tls_key: bool = false,
     persistence: PersistenceConfig = .{},
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.owns_host) allocator.free(self.host);
+        if (self.owns_requirepass) {
+            if (self.requirepass) |pwd| allocator.free(pwd);
+        }
+        if (self.owns_tls_cert) {
+            if (self.tls_cert) |path| allocator.free(path);
+        }
+        if (self.owns_tls_key) {
+            if (self.tls_key) |path| allocator.free(path);
+        }
         self.persistence.deinit(allocator);
         self.* = .{};
+    }
+
+    pub fn authRequired(self: *const Config) bool {
+        return if (self.requirepass) |pwd| pwd.len > 0 else false;
+    }
+
+    pub fn tlsEnabled(self: *const Config) bool {
+        return self.tls_cert != null and self.tls_key != null;
+    }
+
+    pub fn passwordsEqual(self: *const Config, provided: []const u8) bool {
+        const expected = self.requirepass orelse return false;
+        if (expected.len != provided.len) return false;
+        var diff: u8 = 0;
+        for (expected, provided) |a, b| {
+            diff |= a ^ b;
+        }
+        return diff == 0;
     }
 };
 
@@ -103,6 +136,27 @@ fn applyEnvDefaults(allocator: std.mem.Allocator, config: *Config) !void {
     if (std.posix.getenv("REDZ_PORT")) |port_str| {
         config.port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
     }
+    if (std.posix.getenv("REDZ_REQUIREPASS")) |password| {
+        var owned = true;
+        var slot: []const u8 = "";
+        try replaceOwnedString(allocator, &slot, &owned, password);
+        config.requirepass = slot;
+        config.owns_requirepass = true;
+    }
+    if (std.posix.getenv("REDZ_TLS_CERT")) |path| {
+        var owned = true;
+        var slot: []const u8 = "";
+        try replaceOwnedString(allocator, &slot, &owned, path);
+        config.tls_cert = slot;
+        config.owns_tls_cert = true;
+    }
+    if (std.posix.getenv("REDZ_TLS_KEY")) |path| {
+        var owned = true;
+        var slot: []const u8 = "";
+        try replaceOwnedString(allocator, &slot, &owned, path);
+        config.tls_key = slot;
+        config.owns_tls_key = true;
+    }
     if (std.posix.getenv("REDZ_PERSISTENCE")) |mode| {
         config.persistence.mode = parsePersistenceMode(mode) orelse return error.InvalidPersistenceMode;
     }
@@ -138,6 +192,27 @@ fn parseOptionArgs(allocator: std.mem.Allocator, args: []const []const u8) !Conf
         } else if (std.mem.eql(u8, arg, "--port")) {
             const value = try requireArg(args, &i, error.MissingPortValue);
             config.port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, arg, "--requirepass")) {
+            const value = try requireArg(args, &i, error.MissingRequirepassValue);
+            var owned = true;
+            var slot: []const u8 = "";
+            try replaceOwnedString(allocator, &slot, &owned, value);
+            config.requirepass = slot;
+            config.owns_requirepass = true;
+        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+            const value = try requireArg(args, &i, error.MissingTlsCertValue);
+            var owned = true;
+            var slot: []const u8 = "";
+            try replaceOwnedString(allocator, &slot, &owned, value);
+            config.tls_cert = slot;
+            config.owns_tls_cert = true;
+        } else if (std.mem.eql(u8, arg, "--tls-key")) {
+            const value = try requireArg(args, &i, error.MissingTlsKeyValue);
+            var owned = true;
+            var slot: []const u8 = "";
+            try replaceOwnedString(allocator, &slot, &owned, value);
+            config.tls_key = slot;
+            config.owns_tls_key = true;
         } else if (std.mem.eql(u8, arg, "--persistence")) {
             const value = try requireArg(args, &i, error.MissingPersistenceValue);
             config.persistence.mode = parsePersistenceMode(value) orelse return error.InvalidPersistenceMode;
@@ -159,7 +234,14 @@ fn parseOptionArgs(allocator: std.mem.Allocator, args: []const []const u8) !Conf
         }
     }
 
+    try validateTlsConfig(&config);
     return config;
+}
+
+fn validateTlsConfig(config: *const Config) !void {
+    const has_cert = config.tls_cert != null;
+    const has_key = config.tls_key != null;
+    if (has_cert != has_key) return error.TlsCertKeyMismatch;
 }
 
 pub fn parseFromArgv(allocator: std.mem.Allocator, argv: []const []const u8) !Config {
@@ -245,6 +327,34 @@ test "parseFromArgv rejects invalid and missing values" {
     try std.testing.expectError(
         error.InvalidPort,
         parseFromArgv(std.testing.allocator, &[_][]const u8{ "redz", "--port", "notaport" }),
+    );
+}
+
+test "parseFromArgv parses requirepass and tls options" {
+    const argv = [_][]const u8{
+        "redz",
+        "--requirepass",
+        "s3cret",
+        "--tls-cert",
+        "cert.pem",
+        "--tls-key",
+        "key.pem",
+    };
+    var config = try parseFromArgv(std.testing.allocator, &argv);
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expect(config.authRequired());
+    try std.testing.expect(config.passwordsEqual("s3cret"));
+    try std.testing.expect(!config.passwordsEqual("wrong"));
+    try std.testing.expect(config.tlsEnabled());
+    try std.testing.expectEqualStrings("cert.pem", config.tls_cert.?);
+    try std.testing.expectEqualStrings("key.pem", config.tls_key.?);
+}
+
+test "parseFromArgv rejects incomplete tls options" {
+    try std.testing.expectError(
+        error.TlsCertKeyMismatch,
+        parseFromArgv(std.testing.allocator, &[_][]const u8{ "redz", "--tls-cert", "cert.pem" }),
     );
 }
 
