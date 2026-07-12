@@ -5,9 +5,29 @@ pub const RespCommand = struct {
     args: [][]const u8, // name excluded
 };
 
+pub const ParsedCommand = struct {
+    command: RespCommand,
+    bytes_consumed: usize,
+};
+
+pub fn parseCommandFromBuffer(allocator: std.mem.Allocator, data: []const u8) !ParsedCommand {
+    var fbs = std.io.fixedBufferStream(data);
+    const command = parseCommand(allocator, fbs.reader()) catch |err| switch (err) {
+        error.IncompleteResp => return error.IncompleteResp,
+        else => {
+            if (fbs.pos >= data.len) return error.IncompleteResp;
+            return err;
+        },
+    };
+    return .{
+        .command = command,
+        .bytes_consumed = fbs.pos,
+    };
+}
+
 pub fn parseCommand(allocator: std.mem.Allocator, reader: anytype) !RespCommand {
     var buf: [512]u8 = undefined;
-    const first_byte = reader.readByte() catch return error.InvalidResp;
+    const first_byte = try readByteOrIncomplete(reader);
     if (first_byte != '*') return error.InvalidResp;
 
     const count_line = try readLine(reader, &buf);
@@ -32,12 +52,16 @@ pub fn parseCommand(allocator: std.mem.Allocator, reader: anytype) !RespCommand 
     };
 }
 
+fn readByteOrIncomplete(reader: anytype) !u8 {
+    return reader.readByte() catch return error.IncompleteResp;
+}
+
 fn readLine(reader: anytype, buf: []u8) ![]const u8 {
     var i: usize = 0;
     while (i < buf.len) {
-        const b = reader.readByte() catch return error.InvalidResp;
+        const b = try readByteOrIncomplete(reader);
         if (b == '\r') {
-            const next = reader.readByte() catch return error.InvalidResp;
+            const next = try readByteOrIncomplete(reader);
             if (next != '\n') return error.InvalidResp;
             return buf[0..i];
         }
@@ -49,15 +73,15 @@ fn readLine(reader: anytype, buf: []u8) ![]const u8 {
 
 fn readBulkString(allocator: std.mem.Allocator, reader: anytype) ![]const u8 {
     var len_buf: [32]u8 = undefined;
-    const dollar = reader.readByte() catch return error.InvalidResp;
+    const dollar = try readByteOrIncomplete(reader);
     if (dollar != '$') return error.InvalidResp;
     const len_line = try readLine(reader, &len_buf);
     const len = std.fmt.parseInt(usize, len_line, 10) catch return error.InvalidResp;
     const payload = try allocator.alloc(u8, len);
     errdefer allocator.free(payload);
-    reader.readNoEof(payload) catch return error.InvalidResp;
+    reader.readNoEof(payload) catch return error.IncompleteResp;
     var cr: [2]u8 = undefined;
-    reader.readNoEof(cr[0..]) catch return error.InvalidResp;
+    reader.readNoEof(cr[0..]) catch return error.IncompleteResp;
     if (cr[0] != '\r' or cr[1] != '\n') return error.InvalidResp;
     return payload;
 }
@@ -156,4 +180,14 @@ test "resp parseCommand PING SET EXPIRE" {
     try std.testing.expect(cmd3.args.len == 2);
     try std.testing.expectEqualStrings(cmd3.args[0], "key");
     try std.testing.expectEqualStrings(cmd3.args[1], "5");
+}
+
+test "resp parseCommandFromBuffer reports consumed bytes and incomplete input" {
+    const allocator = std.testing.allocator;
+    const payload = "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
+    var first = try parseCommandFromBuffer(allocator, payload);
+    defer freeCommand(allocator, &first.command);
+    try std.testing.expectEqual(@as(usize, 14), first.bytes_consumed);
+
+    try std.testing.expectError(error.IncompleteResp, parseCommandFromBuffer(allocator, payload[0..10]));
 }

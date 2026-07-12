@@ -98,8 +98,7 @@ pub const Store = struct {
         const now = std.time.timestamp();
         var removed: usize = 0;
         for (keys) |key| {
-            if (self.removeIfExpired(now, key)) removed += 1
-            else if (self.map.fetchRemove(key)) |kv| {
+            if (self.removeIfExpired(now, key)) removed += 1 else if (self.map.fetchRemove(key)) |kv| {
                 self.allocator.free(kv.key);
                 self.freeEntryValue(@constCast(&kv.value.value));
                 removed += 1;
@@ -472,7 +471,7 @@ test "store set get del exists" {
     try std.testing.expectEqualStrings(store.get("foo").?, "baz");
 
     try store.set("a", "1");
-    try std.testing.expect(store.exists(&[_][]const u8{"foo", "a"}) == 2);
+    try std.testing.expect(store.exists(&[_][]const u8{ "foo", "a" }) == 2);
 
     const n = store.del(&[_][]const u8{"foo"});
     try std.testing.expect(n == 1);

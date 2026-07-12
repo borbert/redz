@@ -54,19 +54,25 @@ pub const PersistenceConfig = struct {
     }
 };
 
+pub const Config = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 6379,
+    owns_host: bool = false,
+    persistence: PersistenceConfig = .{},
+
+    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        if (self.owns_host) allocator.free(self.host);
+        self.persistence.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 pub fn parsePersistenceMode(s: []const u8) ?PersistenceMode {
-    if (std.mem.eql(u8, s, "none")) return .none;
-    if (std.mem.eql(u8, s, "rdb")) return .rdb;
-    if (std.mem.eql(u8, s, "aof")) return .aof;
-    if (std.mem.eql(u8, s, "both")) return .both;
-    return null;
+    return std.meta.stringToEnum(PersistenceMode, s);
 }
 
 pub fn parseAofFsyncMode(s: []const u8) ?AofFsyncMode {
-    if (std.mem.eql(u8, s, "always")) return .always;
-    if (std.mem.eql(u8, s, "everysec")) return .everysec;
-    if (std.mem.eql(u8, s, "no")) return .no;
-    return null;
+    return std.meta.stringToEnum(AofFsyncMode, s);
 }
 
 fn replaceOwnedString(
@@ -81,49 +87,84 @@ fn replaceOwnedString(
     owns_slot.* = true;
 }
 
-fn parseOptionArgs(allocator: std.mem.Allocator, args: []const []const u8) !PersistenceConfig {
-    var config = PersistenceConfig{};
+fn requireArg(args: []const []const u8, index: *usize, missing: anyerror) ![]const u8 {
+    index.* += 1;
+    if (index.* >= args.len) return missing;
+    return args[index.*];
+}
+
+fn applyEnvDefaults(allocator: std.mem.Allocator, config: *Config) !void {
+    if (std.posix.getenv("REDZ_HOST")) |host| {
+        try replaceOwnedString(allocator, &config.host, &config.owns_host, host);
+    }
+    if (std.posix.getenv("REDZ_PORT")) |port_str| {
+        config.port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
+    }
+    if (std.posix.getenv("REDZ_PERSISTENCE")) |mode| {
+        config.persistence.mode = parsePersistenceMode(mode) orelse return error.InvalidPersistenceMode;
+    }
+    if (std.posix.getenv("REDZ_DATA_DIR")) |dir| {
+        try replaceOwnedString(allocator, &config.persistence.data_dir, &config.persistence.owns_data_dir, dir);
+    }
+    if (std.posix.getenv("REDZ_RDB_FILENAME")) |name| {
+        try replaceOwnedString(allocator, &config.persistence.rdb_filename, &config.persistence.owns_rdb_filename, name);
+    }
+    if (std.posix.getenv("REDZ_AOF_FILENAME")) |name| {
+        try replaceOwnedString(allocator, &config.persistence.aof_filename, &config.persistence.owns_aof_filename, name);
+    }
+    if (std.posix.getenv("REDZ_SNAPSHOT_INTERVAL")) |value| {
+        config.persistence.snapshot_interval_seconds = std.fmt.parseInt(u32, value, 10) catch return error.InvalidSnapshotInterval;
+    }
+    if (std.posix.getenv("REDZ_AOF_FSYNC")) |value| {
+        config.persistence.aof_fsync = parseAofFsyncMode(value) orelse return error.InvalidAofFsync;
+    }
+}
+
+fn parseOptionArgs(allocator: std.mem.Allocator, args: []const []const u8) !Config {
+    var config = Config{};
     errdefer config.deinit(allocator);
+
+    try applyEnvDefaults(allocator, &config);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--persistence")) {
-            i += 1;
-            if (i >= args.len) return error.MissingPersistenceValue;
-            config.mode = parsePersistenceMode(args[i]) orelse return error.InvalidPersistenceMode;
+        if (std.mem.eql(u8, arg, "--host")) {
+            const value = try requireArg(args, &i, error.MissingHostValue);
+            try replaceOwnedString(allocator, &config.host, &config.owns_host, value);
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            const value = try requireArg(args, &i, error.MissingPortValue);
+            config.port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, arg, "--persistence")) {
+            const value = try requireArg(args, &i, error.MissingPersistenceValue);
+            config.persistence.mode = parsePersistenceMode(value) orelse return error.InvalidPersistenceMode;
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
-            i += 1;
-            if (i >= args.len) return error.MissingDataDirValue;
-            try replaceOwnedString(allocator, &config.data_dir, &config.owns_data_dir, args[i]);
+            const value = try requireArg(args, &i, error.MissingDataDirValue);
+            try replaceOwnedString(allocator, &config.persistence.data_dir, &config.persistence.owns_data_dir, value);
         } else if (std.mem.eql(u8, arg, "--rdb-filename")) {
-            i += 1;
-            if (i >= args.len) return error.MissingRdbFilenameValue;
-            try replaceOwnedString(allocator, &config.rdb_filename, &config.owns_rdb_filename, args[i]);
+            const value = try requireArg(args, &i, error.MissingRdbFilenameValue);
+            try replaceOwnedString(allocator, &config.persistence.rdb_filename, &config.persistence.owns_rdb_filename, value);
         } else if (std.mem.eql(u8, arg, "--aof-filename")) {
-            i += 1;
-            if (i >= args.len) return error.MissingAofFilenameValue;
-            try replaceOwnedString(allocator, &config.aof_filename, &config.owns_aof_filename, args[i]);
+            const value = try requireArg(args, &i, error.MissingAofFilenameValue);
+            try replaceOwnedString(allocator, &config.persistence.aof_filename, &config.persistence.owns_aof_filename, value);
         } else if (std.mem.eql(u8, arg, "--snapshot-interval")) {
-            i += 1;
-            if (i >= args.len) return error.MissingSnapshotIntervalValue;
-            config.snapshot_interval_seconds = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidSnapshotInterval;
+            const value = try requireArg(args, &i, error.MissingSnapshotIntervalValue);
+            config.persistence.snapshot_interval_seconds = std.fmt.parseInt(u32, value, 10) catch return error.InvalidSnapshotInterval;
         } else if (std.mem.eql(u8, arg, "--aof-fsync")) {
-            i += 1;
-            if (i >= args.len) return error.MissingAofFsyncValue;
-            config.aof_fsync = parseAofFsyncMode(args[i]) orelse return error.InvalidAofFsync;
+            const value = try requireArg(args, &i, error.MissingAofFsyncValue);
+            config.persistence.aof_fsync = parseAofFsyncMode(value) orelse return error.InvalidAofFsync;
         }
     }
 
     return config;
 }
 
-pub fn parseFromArgv(allocator: std.mem.Allocator, argv: []const []const u8) !PersistenceConfig {
+pub fn parseFromArgv(allocator: std.mem.Allocator, argv: []const []const u8) !Config {
     if (argv.len == 0) return parseOptionArgs(allocator, &.{});
     return parseOptionArgs(allocator, argv[1..]);
 }
 
-pub fn parseFromArgs(allocator: std.mem.Allocator) !PersistenceConfig {
+pub fn parseFromArgs(allocator: std.mem.Allocator) !Config {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
@@ -145,9 +186,13 @@ test "parsePersistenceMode accepts supported modes" {
     try std.testing.expectEqual(@as(?PersistenceMode, null), parsePersistenceMode("invalid"));
 }
 
-test "parseFromArgv parses persistence options" {
+test "parseFromArgv parses host port and persistence options" {
     const argv = [_][]const u8{
         "redz",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "6380",
         "--persistence",
         "both",
         "--data-dir",
@@ -165,14 +210,16 @@ test "parseFromArgv parses persistence options" {
     var config = try parseFromArgv(std.testing.allocator, &argv);
     defer config.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(PersistenceMode.both, config.mode);
-    try std.testing.expectEqualStrings("var/redz", config.data_dir);
-    try std.testing.expectEqualStrings("snapshot.rdb", config.rdb_filename);
-    try std.testing.expectEqualStrings("append.aof", config.aof_filename);
-    try std.testing.expectEqual(@as(u32, 120), config.snapshot_interval_seconds);
-    try std.testing.expectEqual(AofFsyncMode.always, config.aof_fsync);
-    try std.testing.expect(config.rdbEnabled());
-    try std.testing.expect(config.aofEnabled());
+    try std.testing.expectEqualStrings("0.0.0.0", config.host);
+    try std.testing.expectEqual(@as(u16, 6380), config.port);
+    try std.testing.expectEqual(PersistenceMode.both, config.persistence.mode);
+    try std.testing.expectEqualStrings("var/redz", config.persistence.data_dir);
+    try std.testing.expectEqualStrings("snapshot.rdb", config.persistence.rdb_filename);
+    try std.testing.expectEqualStrings("append.aof", config.persistence.aof_filename);
+    try std.testing.expectEqual(@as(u32, 120), config.persistence.snapshot_interval_seconds);
+    try std.testing.expectEqual(AofFsyncMode.always, config.persistence.aof_fsync);
+    try std.testing.expect(config.persistence.rdbEnabled());
+    try std.testing.expect(config.persistence.aofEnabled());
 }
 
 test "parseFromArgv rejects invalid and missing values" {
@@ -191,6 +238,10 @@ test "parseFromArgv rejects invalid and missing values" {
     try std.testing.expectError(
         error.InvalidAofFsync,
         parseFromArgv(std.testing.allocator, &[_][]const u8{ "redz", "--aof-fsync", "sometimes" }),
+    );
+    try std.testing.expectError(
+        error.InvalidPort,
+        parseFromArgv(std.testing.allocator, &[_][]const u8{ "redz", "--port", "notaport" }),
     );
 }
 

@@ -18,11 +18,9 @@ pub const Server = struct {
     address: net.Address,
 
     pub fn init(host: []const u8, port: u16) !Server {
-        // Build an Address from host/port
         const ip4 = try net.Ip4Address.parse(host, port);
         const addr = net.Address{ .in = ip4 };
 
-        // Use the high-level listen helper (handles bind/listen/reuseaddr).[page:3]
         const server = try addr.listen(.{
             .reuse_address = true,
         });
@@ -56,36 +54,42 @@ pub const Server = struct {
             }
 
             const client = try self.listener.accept();
-            // client has: .stream (TcpStream) and .address
-
-            var conn = Connection{
-                .socket = client.stream.handle, // underlying fd
+            const conn = try std.heap.page_allocator.create(Connection);
+            conn.* = .{
+                .socket = client.stream.handle,
                 .addr = client.address,
             };
 
-            handler.handleConnection(&conn) catch |err| {
-                std.log.err("handler error: {s}", .{@errorName(err)});
+            const thread = std.Thread.spawn(.{}, connectionWorker, .{ handler, conn }) catch |err| {
+                conn.close();
+                std.heap.page_allocator.destroy(conn);
+                std.log.err("failed to spawn connection thread: {s}", .{@errorName(err)});
+                continue;
             };
-
-            conn.close(); // closes the stream via fd
+            thread.detach();
         }
     }
 };
 
+fn connectionWorker(handler: *const ConnectionHandler, conn: *Connection) void {
+    defer {
+        conn.close();
+        std.heap.page_allocator.destroy(conn);
+    }
+    handler.handleConnection(conn) catch |err| {
+        std.log.err("handler error: {s}", .{@errorName(err)});
+    };
+}
+
 pub const Connection = struct {
     socket: posix.socket_t,
     addr: net.Address,
-    // later we can add buffer(s), timeouts, etc.
 
     pub fn readRequest(self: *Connection, buf: []u8) !usize {
-        // blocking read into buf, return bytes read or error
-
-        const n = try posix.read(self.socket, buf);
-        return n;
+        return posix.read(self.socket, buf);
     }
 
     pub fn writeAll(self: *Connection, data: []const u8) !void {
-        // loop on posix.write until all bytes written
         var offset: usize = 0;
         while (offset < data.len) {
             const written = try posix.write(
@@ -100,7 +104,6 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        // close socket
         posix.close(self.socket);
     }
 };

@@ -4,3 +4,9 @@ zig-out/
 *.a
 dump.redz
 appendonly.redz.aof
+*.redz
+*.redz.aof
+/data/
+.env
+.env.*
+!.env.example
