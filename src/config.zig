@@ -31,14 +31,17 @@ pub const PersistenceConfig = struct {
         self.* = .{};
     }
 
+    fn joinDataPath(self: *const PersistenceConfig, allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {
+        if (self.data_dir.len == 0) return allocator.dupe(u8, filename);
+        return std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, filename });
+    }
+
     pub fn rdbPath(self: *const PersistenceConfig, allocator: std.mem.Allocator) ![]const u8 {
-        if (self.data_dir.len == 0) return allocator.dupe(u8, self.rdb_filename);
-        return std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, self.rdb_filename });
+        return self.joinDataPath(allocator, self.rdb_filename);
     }
 
     pub fn aofPath(self: *const PersistenceConfig, allocator: std.mem.Allocator) ![]const u8 {
-        if (self.data_dir.len == 0) return allocator.dupe(u8, self.aof_filename);
-        return std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, self.aof_filename });
+        return self.joinDataPath(allocator, self.aof_filename);
     }
 
     pub fn rdbEnabled(self: *const PersistenceConfig) bool {
@@ -160,8 +163,8 @@ fn parseOptionArgs(allocator: std.mem.Allocator, args: []const []const u8) !Conf
 }
 
 pub fn parseFromArgv(allocator: std.mem.Allocator, argv: []const []const u8) !Config {
-    if (argv.len == 0) return parseOptionArgs(allocator, &.{});
-    return parseOptionArgs(allocator, argv[1..]);
+    const options = if (argv.len > 0) argv[1..] else argv;
+    return parseOptionArgs(allocator, options);
 }
 
 pub fn parseFromArgs(allocator: std.mem.Allocator) !Config {

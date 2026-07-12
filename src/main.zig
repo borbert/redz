@@ -28,13 +28,15 @@ fn installShutdownSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
 }
 
+fn logErr(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) std.log.err(fmt, args);
+}
+
 fn preparePersistenceDataDir(config: *const config_mod.PersistenceConfig) !void {
     if (!config.persistenceEnabled() or config.data_dir.len == 0) return;
 
     std.fs.cwd().makePath(config.data_dir) catch |err| {
-        if (!builtin.is_test) {
-            std.log.err("failed to create persistence data dir '{s}': {}", .{ config.data_dir, err });
-        }
+        logErr("failed to create persistence data dir '{s}': {}", .{ config.data_dir, err });
         return err;
     };
 }
@@ -55,18 +57,14 @@ fn loadStartupRdb(
             return;
         },
         else => {
-            if (!builtin.is_test) {
-                std.log.err("failed to open rdb file '{s}': {}", .{ rdb_path, err });
-            }
+            logErr("failed to open rdb file '{s}': {}", .{ rdb_path, err });
             return err;
         },
     };
     defer file.close();
 
     persistence.loadRdb(store, file.deprecatedReader()) catch |err| {
-        if (!builtin.is_test) {
-            std.log.err("failed to load rdb file '{s}': {}", .{ rdb_path, err });
-        }
+        logErr("failed to load rdb file '{s}': {}", .{ rdb_path, err });
         return err;
     };
 
@@ -84,9 +82,7 @@ fn replayStartupAof(
     defer allocator.free(aof_path);
 
     aof.replayAof(allocator, store, aof_path) catch |err| {
-        if (!builtin.is_test) {
-            std.log.err("failed to replay aof file '{s}': {}", .{ aof_path, err });
-        }
+        logErr("failed to replay aof file '{s}': {}", .{ aof_path, err });
         return err;
     };
 
@@ -103,15 +99,22 @@ fn openStartupAof(
     defer allocator.free(aof_path);
 
     var writer = aof.AofWriter.open(aof_path, config.aof_fsync) catch |err| {
-        if (!builtin.is_test) {
-            std.log.err("failed open aof file '{s}': {}", .{ aof_path, err });
-        }
+        logErr("failed to open aof file '{s}': {}", .{ aof_path, err });
         return err;
     };
     errdefer writer.close() catch {};
 
     std.log.info("opened aof file '{s}' with fsync mode {s}", .{ aof_path, @tagName(config.aof_fsync) });
     return writer;
+}
+
+fn closeAofWriter(writer_opt: *?aof.AofWriter) void {
+    if (writer_opt.*) |*writer| {
+        writer.close() catch |err| {
+            std.log.err("aof close failed: {}", .{err});
+        };
+        writer_opt.* = null;
+    }
 }
 
 fn saveShutdownRdb(
@@ -188,13 +191,7 @@ pub fn main() !void {
     try loadStartupRdb(allocator, &config.persistence, &global_store);
     try replayStartupAof(allocator, &config.persistence, &global_store);
     var aof_writer = try openStartupAof(allocator, &config.persistence);
-    defer {
-        if (aof_writer) |*writer| {
-            writer.close() catch |err| {
-                std.log.err("aof close failed: {}", .{err});
-            };
-        }
-    }
+    defer closeAofWriter(&aof_writer);
     var persistence_runtime = persistence.PersistenceRuntime{
         .last_save_unix = std.time.timestamp(),
     };
@@ -224,12 +221,7 @@ pub fn main() !void {
 
     try srv.run(&handler, &shutdown_requested, &poll_hook);
 
-    if (aof_writer) |*writer| {
-        writer.close() catch |err| {
-            std.log.err("aof close failed: {}", .{err});
-        };
-        aof_writer = null;
-    }
+    closeAofWriter(&aof_writer);
 
     store_mutex.lock();
     defer store_mutex.unlock();

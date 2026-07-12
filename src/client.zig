@@ -37,7 +37,7 @@ pub fn handleConnection(raw_context: ?*anyopaque, conn: *server_mod.Connection) 
                 if (!try readMore(conn, allocator, &input, &read_buf)) return;
                 continue;
             },
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => return err,
             else => {
                 try writeProtocolError(conn, "ERR invalid RESP");
                 return;
@@ -48,12 +48,15 @@ pub fn handleConnection(raw_context: ?*anyopaque, conn: *server_mod.Connection) 
         const raw_command = try allocator.dupe(u8, input.items[0..parsed.bytes_consumed]);
         defer allocator.free(raw_command);
 
-        const remaining = input.items.len - parsed.bytes_consumed;
-        std.mem.copyForwards(u8, input.items[0..remaining], input.items[parsed.bytes_consumed..]);
-        input.shrinkRetainingCapacity(remaining);
-
+        drainConsumed(&input, parsed.bytes_consumed);
         try processCommand(app_context, conn, &parsed.command, raw_command);
     }
+}
+
+fn drainConsumed(input: *std.ArrayList(u8), consumed: usize) void {
+    const remaining = input.items.len - consumed;
+    std.mem.copyForwards(u8, input.items[0..remaining], input.items[consumed..]);
+    input.shrinkRetainingCapacity(remaining);
 }
 
 fn readMore(
@@ -116,19 +119,21 @@ fn processCommand(
         return;
     };
 
-    if (commands.isMutatingCommand(cmd.name)) {
-        if (app_context.aof_writer) |aof_writer| {
-            if (aof_writer.append(raw_command)) |_| {
-                aof_writer.maybeFsync(std.time.timestamp()) catch |fsync_err| {
-                    std.log.err("aof fsync failed after successful command '{s}': {}", .{ cmd.name, fsync_err });
-                };
-            } else |err| {
-                std.log.err("aof append failed after successful command '{s}': {}", .{ cmd.name, err });
-            }
-        }
-    }
-
+    maybeAppendAof(app_context, cmd.name, raw_command);
     try conn.writeAll(out_fbs.getWritten());
+}
+
+fn maybeAppendAof(app_context: *AppContext, cmd_name: []const u8, raw_command: []const u8) void {
+    if (!commands.isMutatingCommand(cmd_name)) return;
+    const aof_writer = app_context.aof_writer orelse return;
+
+    aof_writer.append(raw_command) catch |err| {
+        std.log.err("aof append failed after successful command '{s}': {}", .{ cmd_name, err });
+        return;
+    };
+    aof_writer.maybeFsync(std.time.timestamp()) catch |fsync_err| {
+        std.log.err("aof fsync failed after successful command '{s}': {}", .{ cmd_name, fsync_err });
+    };
 }
 
 test "pipeline parses multiple commands from one buffer" {

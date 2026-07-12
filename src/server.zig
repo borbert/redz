@@ -41,8 +41,10 @@ pub const Server = struct {
         stop_flag: ?*const StopFlag,
         poll_hook: ?*const PollHook,
     ) !void {
-        while (stop_flag == null or !stop_flag.?.load(.acquire)) {
-            if (stop_flag != null) {
+        while (true) {
+            if (stop_flag) |flag| {
+                if (flag.load(.acquire)) break;
+
                 var fds = [_]posix.pollfd{.{
                     .fd = self.listener.stream.handle,
                     .events = posix.POLL.IN,

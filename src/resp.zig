@@ -12,12 +12,9 @@ pub const ParsedCommand = struct {
 
 pub fn parseCommandFromBuffer(allocator: std.mem.Allocator, data: []const u8) !ParsedCommand {
     var fbs = std.io.fixedBufferStream(data);
-    const command = parseCommand(allocator, fbs.reader()) catch |err| switch (err) {
-        error.IncompleteResp => return error.IncompleteResp,
-        else => {
-            if (fbs.pos >= data.len) return error.IncompleteResp;
-            return err;
-        },
+    const command = parseCommand(allocator, fbs.reader()) catch |err| {
+        if (err == error.IncompleteResp or fbs.pos >= data.len) return error.IncompleteResp;
+        return err;
     };
     return .{
         .command = command,
@@ -36,15 +33,17 @@ pub fn parseCommand(allocator: std.mem.Allocator, reader: anytype) !RespCommand 
 
     var names = try allocator.alloc([]const u8, count);
     var filled: usize = 0;
-    errdefer allocator.free(names);
-    errdefer for (names[0..filled]) |s| allocator.free(s);
+    errdefer {
+        for (names[0..filled]) |s| allocator.free(s);
+        allocator.free(names);
+    }
     for (0..count) |i| {
         names[i] = try readBulkString(allocator, reader);
         filled = i + 1;
     }
 
     const name = names[0];
-    const args = if (count > 1) try allocator.dupe([]const u8, names[1..]) else try allocator.alloc([]const u8, 0);
+    const args = try allocator.dupe([]const u8, names[1..]);
     allocator.free(names);
     return .{
         .name = name,
@@ -93,15 +92,11 @@ pub fn freeCommand(allocator: std.mem.Allocator, cmd: *RespCommand) void {
 }
 
 pub fn writeSimpleString(writer: anytype, s: []const u8) !void {
-    try writer.writeAll("+");
-    try writer.writeAll(s);
-    try writer.writeAll("\r\n");
+    try writer.print("+{s}\r\n", .{s});
 }
 
 pub fn writeError(writer: anytype, s: []const u8) !void {
-    try writer.writeAll("-");
-    try writer.writeAll(s);
-    try writer.writeAll("\r\n");
+    try writer.print("-{s}\r\n", .{s});
 }
 
 pub fn writeBulkString(writer: anytype, s: ?[]const u8) !void {

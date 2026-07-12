@@ -84,8 +84,9 @@ pub const Store = struct {
 
     pub fn get(self: *Store, key: []const u8) ?[]const u8 {
         const entry = self.map.getPtr(key) orelse return null;
-        if (self.isExpired(std.time.timestamp(), entry)) {
-            _ = self.removeIfExpired(std.time.timestamp(), key);
+        const now = std.time.timestamp();
+        if (self.isExpired(now, entry)) {
+            _ = self.removeIfExpired(now, key);
             return null;
         }
         return switch (entry.value) {
